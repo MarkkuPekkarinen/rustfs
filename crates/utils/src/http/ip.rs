@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use http::HeaderMap;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use regex::Regex;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -43,6 +44,78 @@ fn is_xff_header_enabled() -> bool {
         .unwrap_or_else(|_| "on".to_string())
         .to_lowercase()
         == "on"
+}
+
+/// TrustedProxies holds configuration for validating proxy sources
+#[derive(Debug, Clone)]
+pub struct TrustedProxies {
+    /// List of trusted proxy IP networks (CIDR format)
+    pub cidrs: Vec<IpNet>,
+    /// Whether to enable proxy validation
+    pub enable_validation: bool,
+    /// Maximum allowed proxy chain length
+    pub max_chain_length: usize,
+}
+
+impl TrustedProxies {
+    /// Create a new TrustedProxies configuration
+    pub fn new(cidrs: Vec<String>, enable_validation: bool, max_chain_length: usize) -> Self {
+        let cidrs = cidrs.into_iter()
+            .filter_map(|s| s.parse::<IpNet>().ok())
+            .collect();
+        Self { cidrs, enable_validation, max_chain_length }
+    }
+
+    /// Check if an IP address is within the trusted proxy ranges
+    pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        if !self.enable_validation {
+            return true; // Backward compatibility: trust all when disabled
+        }
+        self.cidrs.iter().any(|net| net.contains(&ip))
+    }
+}
+
+impl Default for TrustedProxies {
+    fn default() -> Self {
+        Self {
+            cidrs: vec![],
+            enable_validation: true,
+            max_chain_length: 10,
+        }
+    }
+}
+
+/// Validate if an IP string represents a valid client IP
+/// Returns false for private/loopback addresses and invalid formats
+fn is_valid_client_ip(ip_str: &str, max_chain_length: usize) -> bool {
+    // Handle X-Forwarded-For chains
+    if ip_str.contains(',') {
+        let parts: Vec<&str> = ip_str.split(',').map(|s| s.trim()).collect();
+        if parts.len() > max_chain_length {
+            return false;
+        }
+        // Validate each IP in the chain
+        for part in parts {
+            if !is_valid_single_ip(part) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    is_valid_single_ip(ip_str)
+}
+
+/// Validate a single IP address string
+fn is_valid_single_ip(ip_str: &str) -> bool {
+    match ip_str.parse::<IpAddr>() {
+        Ok(ip) => {
+            // Reject private and loopback addresses as client IPs
+            // (they should come from trusted proxies only)
+            !ip.is_private() && !ip.is_loopback()
+        }
+        Err(_) => false,
+    }
 }
 
 /// GetSourceScheme retrieves the scheme from the X-Forwarded-Proto and RFC7239
@@ -147,18 +220,43 @@ pub fn get_source_ip_from_headers(headers: &HeaderMap) -> Option<String> {
     addr
 }
 
-/// GetSourceIPRaw retrieves the IP from the request headers
-/// and falls back to remote_addr when necessary.
-/// however returns without bracketing.
+/// GetSourceIPRaw retrieves the IP from the request headers with trusted proxy validation
+/// and falls back to peer_addr when necessary.
 ///
 /// # Arguments
 /// * `headers` - HTTP headers from the request
-/// * `remote_addr` - Remote address as a string
+/// * `peer_addr` - Peer IP address from the connection
+/// * `trusted_proxies` - Trusted proxy configuration
 ///
 /// # Returns
-/// A `String` containing the source IP address
+/// A `String` containing the validated source IP address
 ///
-pub fn get_source_ip_raw(headers: &HeaderMap, remote_addr: &str) -> String {
+pub fn get_source_ip_raw(headers: &HeaderMap, peer_addr: IpAddr, trusted_proxies: &TrustedProxies) -> String {
+    // If validation is disabled, use legacy behavior for backward compatibility
+    if !trusted_proxies.enable_validation {
+        let remote_addr_str = peer_addr.to_string();
+        return get_source_ip_raw_legacy(headers, &remote_addr_str);
+    }
+
+    // Check if the direct connection is from a trusted proxy
+    if trusted_proxies.is_trusted_proxy(peer_addr) {
+        // Trusted proxy: try to get real client IP from headers
+        if let Some(header_ip) = get_source_ip_from_headers(headers) {
+            // Validate the IP from headers
+            if is_valid_client_ip(&header_ip, trusted_proxies.max_chain_length) {
+                return header_ip;
+            }
+            // If header IP is invalid, log warning and fall back to peer
+            tracing::warn!("Invalid client IP in headers from trusted proxy {}: {}", peer_addr, header_ip);
+        }
+    }
+
+    // Untrusted source or no valid header IP: use connection peer address
+    peer_addr.to_string()
+}
+
+/// Legacy GetSourceIPRaw for backward compatibility when validation is disabled
+fn get_source_ip_raw_legacy(headers: &HeaderMap, remote_addr: &str) -> String {
     let addr = get_source_ip_from_headers(headers).unwrap_or_else(|| remote_addr.to_string());
 
     // Default to remote address if headers not set.
@@ -169,19 +267,20 @@ pub fn get_source_ip_raw(headers: &HeaderMap, remote_addr: &str) -> String {
     }
 }
 
-/// GetSourceIP retrieves the IP from the request headers
-/// and falls back to remote_addr when necessary.
+/// GetSourceIP retrieves the IP from the request headers with trusted proxy validation
+/// and falls back to peer_addr when necessary.
 /// It brackets IPv6 addresses.
 ///
 /// # Arguments
 /// * `headers` - HTTP headers from the request
-/// * `remote_addr` - Remote address as a string
+/// * `peer_addr` - Peer IP address from the connection
+/// * `trusted_proxies` - Trusted proxy configuration
 ///
 /// # Returns
 /// A `String` containing the source IP address, with IPv6 addresses bracketed
 ///
-pub fn get_source_ip(headers: &HeaderMap, remote_addr: &str) -> String {
-    let addr = get_source_ip_raw(headers, remote_addr);
+pub fn get_source_ip(headers: &HeaderMap, peer_addr: IpAddr, trusted_proxies: &TrustedProxies) -> String {
+    let addr = get_source_ip_raw(headers, peer_addr, trusted_proxies);
     if addr.contains(':') { format!("[{addr}]") } else { addr }
 }
 
@@ -210,18 +309,62 @@ mod tests {
     }
 
     #[test]
-    fn test_get_source_ip_raw() {
+    fn test_trusted_proxies_validation() {
+        let trusted_proxies = TrustedProxies::new(
+            vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()],
+            true,
+            5,
+        );
+
+        // Trusted IPs
+        assert!(trusted_proxies.is_trusted_proxy("192.168.1.1".parse().unwrap()));
+        assert!(trusted_proxies.is_trusted_proxy("10.1.1.1".parse().unwrap()));
+
+        // Untrusted IPs
+        assert!(!trusted_proxies.is_trusted_proxy("203.0.113.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_get_source_ip_raw_with_trusted_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.1"));
+
+        let trusted_proxies = TrustedProxies::new(vec!["192.168.1.1/32".to_string()], true, 5);
+        let peer_addr: IpAddr = "192.168.1.1".parse().unwrap();
+
+        let result = get_source_ip_raw(&headers, peer_addr, &trusted_proxies);
+        assert_eq!(result, "203.0.113.1");
+    }
+
+    #[test]
+    fn test_get_source_ip_raw_with_untrusted_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.1"));
+
+        let trusted_proxies = TrustedProxies::new(vec![], true, 5);
+        let peer_addr: IpAddr = "203.0.113.2".parse().unwrap();
+
+        let result = get_source_ip_raw(&headers, peer_addr, &trusted_proxies);
+        assert_eq!(result, "203.0.113.2"); // Should use peer_addr
+    }
+
+    #[test]
+    fn test_get_source_ip_raw_legacy_mode() {
         let headers = create_test_headers();
-        let remote_addr = "127.0.0.1:8080";
-        let result = get_source_ip_raw(&headers, remote_addr);
-        assert_eq!(result, "192.168.1.1");
+        let trusted_proxies = TrustedProxies::new(vec![], false, 5); // Disabled validation
+        let peer_addr: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let result = get_source_ip_raw(&headers, peer_addr, &trusted_proxies);
+        assert_eq!(result, "192.168.1.1"); // Should use header IP
     }
 
     #[test]
     fn test_get_source_ip() {
         let headers = create_test_headers();
-        let remote_addr = "127.0.0.1:8080";
-        let result = get_source_ip(&headers, remote_addr);
+        let trusted_proxies = TrustedProxies::new(vec!["192.168.1.1/32".to_string()], true, 5);
+        let peer_addr: IpAddr = "192.168.1.1".parse().unwrap();
+
+        let result = get_source_ip(&headers, peer_addr, &trusted_proxies);
         assert_eq!(result, "192.168.1.1");
     }
 
@@ -229,8 +372,29 @@ mod tests {
     fn test_get_source_ip_ipv6() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("2001:db8::1"));
-        let remote_addr = "127.0.0.1:8080";
-        let result = get_source_ip(&headers, remote_addr);
+
+        let trusted_proxies = TrustedProxies::new(vec!["192.168.1.1/32".to_string()], true, 5);
+        let peer_addr: IpAddr = "192.168.1.1".parse().unwrap();
+
+        let result = get_source_ip(&headers, peer_addr, &trusted_proxies);
         assert_eq!(result, "[2001:db8::1]");
+    }
+
+    #[test]
+    fn test_is_valid_client_ip() {
+        // Valid public IPs
+        assert!(is_valid_client_ip("203.0.113.1", 5));
+        assert!(is_valid_client_ip("2001:db8::1", 5));
+
+        // Invalid private IPs
+        assert!(!is_valid_client_ip("192.168.1.1", 5));
+        assert!(!is_valid_client_ip("10.0.0.1", 5));
+        assert!(!is_valid_client_ip("127.0.0.1", 5));
+
+        // Valid chain
+        assert!(is_valid_client_ip("203.0.113.1, 198.51.100.1", 5));
+
+        // Invalid chain (too long)
+        assert!(!is_valid_client_ip("203.0.113.1, 198.51.100.1, 192.0.2.1, 192.0.2.2, 192.0.2.3, 192.0.2.4", 5));
     }
 }
