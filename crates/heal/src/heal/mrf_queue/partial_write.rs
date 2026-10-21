@@ -210,6 +210,17 @@ struct Responsibility {
 }
 
 impl Responsibility {
+    fn generation_unobserved(&self) -> bool {
+        self.source_bucket_incarnation_id.is_none() && matches!(self.state, ResponsibilityState::Active)
+    }
+
+    fn is_parked(&self) -> bool {
+        // Legacy source identity cannot be reconstructed from a bucket name.
+        // Derive this hold from the existing durable fields so old checkpoints
+        // need no new state tag and replay cannot restart automatic retries.
+        self.state.is_parked() || self.generation_unobserved()
+    }
+
     fn defer_unverified_attempt(&mut self, now: Instant, base: Duration) {
         self.attempt_in_flight = false;
         self.consecutive_unverified_attempts = self.consecutive_unverified_attempts.saturating_add(1);
@@ -289,7 +300,7 @@ impl PartialWrites {
         }
         let key = PartialWriteKey::new(&intent, source_bucket_incarnation_id);
         let previous = self.entries.get(&key);
-        let previous_was_held = previous.is_some_and(|entry| entry.state.is_parked());
+        let previous_was_held = previous.is_some_and(|entry| entry.is_parked());
         let mut retry_queued = previous.is_some_and(|entry| entry.retry_queued);
         let old_cost = previous.map_or(0, Self::entry_cost);
         let next_bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::cost(&intent));
@@ -407,7 +418,7 @@ impl PartialWrites {
             return false;
         };
         if entry.anchor.as_ref() != Some(anchor)
-            || entry.state.is_parked()
+            || entry.is_parked()
             || anchor.bucket_incarnation_id.is_nil()
             || entry.source_bucket_incarnation_id != Some(anchor.bucket_incarnation_id)
         {
@@ -439,7 +450,9 @@ impl PartialWrites {
     pub(super) fn legacy_generation_unknown_count(&self) -> usize {
         self.entries
             .values()
-            .filter(|entry| matches!(&entry.state, ResponsibilityState::LegacyGenerationUnknown { .. }))
+            .filter(|entry| {
+                entry.generation_unobserved() || matches!(&entry.state, ResponsibilityState::LegacyGenerationUnknown { .. })
+            })
             .count()
     }
 
@@ -502,7 +515,7 @@ impl PartialWrites {
         entry.last_operator_acceptance = record.last_operator_acceptance.clone();
         entry.state = record.state.clone();
         self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
-        if entry.state.is_parked() {
+        if entry.is_parked() {
             entry.retry_queued = false;
         }
         true
@@ -522,7 +535,7 @@ impl PartialWrites {
         self.entries
             .values()
             .find(|entry| entry.responsibility_id == responsibility_id)
-            .is_some_and(|entry| matches!(&entry.state, ResponsibilityState::Active))
+            .is_some_and(|entry| !entry.is_parked())
     }
 
     pub(super) fn last_operator_acceptance(&self, responsibility_id: Uuid) -> Option<MrfOperatorAcceptance> {
@@ -703,7 +716,7 @@ impl PartialWrites {
         entry.last_operator_acceptance = last_operator_acceptance;
         self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         entry.persisted = true;
-        if entry.state.is_parked() {
+        if entry.is_parked() {
             entry.retry_queued = false;
         }
         true
@@ -717,23 +730,24 @@ impl PartialWrites {
         let mut selected = BTreeMap::new();
         for entry in self.entries.values() {
             let (status, bucket_incarnation_id, held_since_ms) = match &entry.state {
+                ResponsibilityState::Active if entry.generation_unobserved() => ("legacy_generation_unobserved", None, None),
                 ResponsibilityState::Active => continue,
                 ResponsibilityState::HeldUnverifiedLegacy {
                     bucket_incarnation_id,
                     since_ms,
-                } => ("held_unverified_legacy", *bucket_incarnation_id, Some(*since_ms)),
+                } => ("held_unverified_legacy", Some(*bucket_incarnation_id), Some(*since_ms)),
                 ResponsibilityState::LegacyGenerationUnknown {
                     observed_bucket_incarnation_id,
                     detected_at_ms,
-                } => ("legacy_generation_unknown", *observed_bucket_incarnation_id, Some(*detected_at_ms)),
+                } => ("legacy_generation_unknown", Some(*observed_bucket_incarnation_id), Some(*detected_at_ms)),
                 ResponsibilityState::BucketIncarnationChanged {
                     observed_bucket_incarnation_id,
                     detected_at_ms,
                     ..
-                } => ("bucket_incarnation_changed", *observed_bucket_incarnation_id, Some(*detected_at_ms)),
+                } => ("bucket_incarnation_changed", Some(*observed_bucket_incarnation_id), Some(*detected_at_ms)),
                 ResponsibilityState::OperatorAcceptedUnverified {
                     bucket_incarnation_id, ..
-                } => ("operator_accepted_unverified", *bucket_incarnation_id, None),
+                } => ("operator_accepted_unverified", Some(*bucket_incarnation_id), None),
             };
             if after.is_some_and(|after| entry.responsibility_id <= after) {
                 continue;
@@ -783,7 +797,7 @@ impl PartialWrites {
     pub(super) fn replace_observed_incarnation(
         &mut self,
         responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
+        expected_bucket_incarnation_id: Option<Uuid>,
         observed_bucket_incarnation_id: Uuid,
         source_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<(ResponsibilityState, Option<MrfOperatorAcceptance>), &'static str> {
@@ -792,8 +806,15 @@ impl PartialWrites {
             .values_mut()
             .find(|entry| entry.responsibility_id == responsibility_id)
             .ok_or("responsibility not found or generation changed")?;
-        if entry.state.bucket_incarnation_id() != Some(expected_bucket_incarnation_id) {
+        if entry.state.bucket_incarnation_id() != expected_bucket_incarnation_id {
             return Err("responsibility changed; refresh the listing");
+        }
+        if observed_bucket_incarnation_id.is_nil()
+            || expected_bucket_incarnation_id.is_some_and(|id| id.is_nil())
+            || (expected_bucket_incarnation_id.is_none() && !entry.generation_unobserved())
+            || entry.source_bucket_incarnation_id != source_bucket_incarnation_id
+        {
+            return Err("responsibility identity changed; refresh the listing");
         }
         let previous = entry.state.clone();
         let previous_acceptance = entry.last_operator_acceptance.clone();
@@ -859,20 +880,6 @@ impl PartialWrites {
             // parked, so every dispatch must compare against a fresh identity.
             if let Some(anchor) = manager.durable_mrf_repair_anchor(&entry.intent).await {
                 entry.anchor = Some(anchor.clone());
-                if entry.source_bucket_incarnation_id.is_none() {
-                    let old_cost = Self::entry_cost(entry);
-                    let detected_at_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
-                    entry.state = ResponsibilityState::LegacyGenerationUnknown {
-                        observed_bucket_incarnation_id: anchor.bucket_incarnation_id,
-                        detected_at_ms,
-                    };
-                    self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
-                    entry.retry_queued = false;
-                    lifecycle_changed = true;
-                    continue;
-                }
                 if let Some(source_bucket_incarnation_id) = entry.source_bucket_incarnation_id
                     && source_bucket_incarnation_id != anchor.bucket_incarnation_id
                 {
@@ -923,7 +930,7 @@ impl PartialWrites {
                 continue;
             };
             entry.retry_queued = false;
-            if entry.state.is_parked() {
+            if entry.is_parked() {
                 // Held obligations remain in the durable responsibility map,
                 // but leave the hot retry index until a new generation arrives.
                 continue;
@@ -981,7 +988,7 @@ pub struct MrfLegacyResponsibility {
     pub version_id: Option<String>,
     pub pool_index: Option<u32>,
     pub set_index: Option<u32>,
-    pub bucket_incarnation_id: Uuid,
+    pub bucket_incarnation_id: Option<Uuid>,
     pub enqueued_at_ms: u64,
     pub status: &'static str,
     pub held_since_ms: Option<u64>,
@@ -1055,6 +1062,62 @@ mod tests {
             reference: reference.to_string(),
             request_id: Uuid::new_v4(),
         }
+    }
+
+    #[test]
+    fn unobserved_legacy_is_held_and_visible_after_checkpoint_replay() {
+        let original = intent("deleted-bucket-legacy");
+        let mut writes = PartialWrites::default();
+        writes.admit(original.clone(), 1, 8192).expect("retain legacy responsibility");
+        writes.mark_persisted();
+        assert!(writes.ready_keys(Instant::now() + Duration::from_secs(86400), 1).is_empty());
+        assert!(writes.retry_order.is_empty(), "unobserved legacy work must leave the hot retry queue");
+        let record = writes.checkpoint_records(|_| Some([7; 32])).remove(0);
+        assert!(record.is_valid());
+        assert!(matches!(record.state, ResponsibilityState::Active), "keep the legacy disk encoding");
+        assert_eq!(record.source_bucket_incarnation_id, None);
+        let (rows, next) = writes.list_unverified_legacy(None, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(next.is_none());
+        assert_eq!(rows[0].status, "legacy_generation_unobserved");
+        assert_eq!(rows[0].bucket_incarnation_id, None);
+        assert_eq!(writes.legacy_generation_unknown_count(), 1);
+        assert!(!writes.is_active_responsibility(record.responsibility_id));
+        let json = serde_json::to_value(&rows[0]).expect("encode unknown observation");
+        assert!(json["bucketIncarnationId"].is_null());
+
+        let encoded = serde_json::to_vec(&record).expect("encode unchanged checkpoint schema");
+        let decoded: ResponsibilityCheckpoint = serde_json::from_slice(&encoded).expect("decode legacy schema");
+        let mut replay = PartialWrites::default();
+        replay.admit(original.clone(), 1, 8192).expect("replay intent");
+        assert!(replay.restore_state(&original, &decoded));
+        replay.mark_persisted();
+        assert!(replay.ready_keys(Instant::now() + Duration::from_secs(86400), 1).is_empty());
+        assert_eq!(replay.checkpoint_records(|_| Some([7; 32])), vec![record]);
+        assert_eq!(replay.list_unverified_legacy(None, 1).0[0].responsibility_id, rows[0].responsibility_id);
+    }
+
+    #[test]
+    fn unobserved_legacy_refresh_preserves_unknown_source_and_rejects_stale_actions() {
+        let original = intent("unobserved-refresh");
+        let mut writes = PartialWrites::default();
+        writes.admit(original, 1, 8192).expect("retain legacy responsibility");
+        let id = writes.list_unverified_legacy(None, 1).0[0].responsibility_id;
+        assert!(writes.replace_observed_incarnation(id, None, Uuid::nil(), None).is_err());
+        let observed = Uuid::new_v4();
+        writes
+            .replace_observed_incarnation(id, None, observed, None)
+            .expect("observe a current generation");
+        let row = writes.list_unverified_legacy(None, 1).0.remove(0);
+        assert_eq!(row.status, "legacy_generation_unknown");
+        assert_eq!(row.bucket_incarnation_id, Some(observed));
+        assert_eq!(row.source_bucket_incarnation_id, None);
+        assert!(writes.replace_observed_incarnation(id, None, Uuid::new_v4(), None).is_err());
+        assert!(
+            writes.recheck(id, observed).is_err(),
+            "observation cannot authorize repair of an unknown source"
+        );
+        assert!(writes.ready_keys(Instant::now() + Duration::from_secs(86400), 1).is_empty());
     }
 
     #[test]
@@ -1409,7 +1472,9 @@ mod tests {
     fn partial_write_retention_retries_rotate_past_a_failing_prefix() {
         let mut writes = PartialWrites::default();
         for object in ["a", "b", "c"] {
-            writes.admit(intent(object), 3, 8192).expect("bounded backlog should fit");
+            writes
+                .admit_with_source_incarnation(intent(object), Some(Uuid::new_v4()), 3, 8192)
+                .expect("bounded source-bound backlog should fit");
         }
         let now = Instant::now();
         assert!(writes.ready_keys(now, 2).is_empty(), "uncommitted responsibility must not be dispatched");
@@ -1597,7 +1662,7 @@ mod tests {
         let (previous, _) = restored
             .replace_observed_incarnation(
                 checkpoint.responsibility_id,
-                original_incarnation,
+                Some(original_incarnation),
                 recreated_incarnation,
                 Some(original_incarnation),
             )
@@ -1926,6 +1991,146 @@ mod tests {
         rustfs_common::mrf_channel::note_mrf_verified_repair(verified_event(&replayed_current_anchor));
         runtime.discharge_durable_replay_anchors();
         assert!(runtime.partial_writes.intent_for_responsibility(current_id).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn source_bound_repair_preserves_same_key_unknown_responsibility_through_replay() {
+        use crate::heal::mrf_queue::{MrfConsumerConfig, MrfQueue, MrfRuntime};
+
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_unknown_and_bound_replay")
+            .build()
+            .await;
+        let bucket = "partial-write-retention";
+        env.make_bucket(bucket, false).await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage, None));
+        let disks = super::super::journal_disks().await;
+        assert!(!disks.is_empty(), "the fixture must register real MRF journal disks");
+        let incarnation = env.ecstore.pools[0]
+            .get_disks(0)
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("the fixture must have an authoritative current incarnation");
+        let config = MrfConsumerConfig::default();
+        let mut writes = PartialWrites::default();
+        let legacy = intent("same-object-unknown-source");
+        writes
+            .admit_with_source_incarnation(legacy.clone(), None, 2, 64 * 1024)
+            .expect("retain a legacy responsibility without inventing its source");
+        writes.mark_persisted();
+        assert!(!writes.dispatch_collecting_lifecycle_change(&manager, &config).await);
+        assert_eq!(writes.legacy_generation_unknown_count(), 1);
+        let original_unknown = writes.checkpoint_records(super::super::intent_digest).remove(0);
+        assert_eq!(original_unknown.source_bucket_incarnation_id, None);
+        assert!(matches!(original_unknown.state, ResponsibilityState::Active));
+        assert_eq!(writes.list_unverified_legacy(None, 10).0[0].status, "legacy_generation_unobserved");
+
+        let current = intent("same-object-unknown-source");
+        assert_eq!(super::super::intent_digest(&legacy), super::super::intent_digest(&current));
+        writes
+            .admit_with_source_incarnation(current.clone(), Some(incarnation), 2, 64 * 1024)
+            .expect("a source-bound write must coexist with the same-key unknown responsibility");
+        writes.mark_persisted();
+        assert_eq!(writes.depth(), 2);
+        let current_id = writes
+            .entries
+            .get(&PartialWriteKey::new(&current, Some(incarnation)))
+            .expect("the source-bound responsibility must be distinct")
+            .responsibility_id;
+        assert_ne!(original_unknown.responsibility_id, current_id);
+
+        let mut journal = Vec::new();
+        for retained in writes.intents() {
+            assert!(super::super::encode_intent(retained, &mut journal));
+        }
+        let lifecycle_limit = config.journal_max_bytes.saturating_mul(4);
+        let owner = Uuid::new_v4();
+        let lifecycle = super::super::encode_mrf_lifecycle_checkpoint(
+            owner,
+            7,
+            writes.checkpoint_records(super::super::intent_digest),
+            lifecycle_limit,
+        )
+        .expect("both same-digest source identities must be representable");
+        super::super::snapshot::publish_committed_snapshot_with_companion(
+            &disks,
+            owner,
+            7,
+            &journal,
+            config.journal_max_bytes,
+            Some((&super::super::MRF_LIFECYCLE_PATHS, &lifecycle, lifecycle_limit)),
+        )
+        .await
+        .expect("publish the actual journal and lifecycle companion atomically");
+
+        let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
+        let replay = super::super::replay_into(&manager, &mut queue, &mut None).await;
+        assert_eq!(replay.partial_writes.len(), 2);
+        let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
+            queue,
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: replay.journal_on_disk,
+            retain_replay_journal: replay.retain_journal_for_replay,
+            durable_replay_anchors: replay.durable_replay_anchors,
+            replay_cleanup: replay.cleanup,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        runtime.adopt_replayed_partial_writes(replay.partial_writes);
+        let current_entry = runtime
+            .partial_writes
+            .entries
+            .get_mut(&PartialWriteKey::new(&current, Some(incarnation)))
+            .expect("replay must restore the source-bound responsibility");
+        assert_eq!(current_entry.responsibility_id, current_id);
+        let anchor = MrfDurableRepairAnchor::from_intent(&current_entry.intent, incarnation)
+            .expect("the replayed attempt must supply its own exact proof anchor");
+        current_entry.anchor = Some(anchor.clone());
+        let proof = |lease| MrfVerifiedRepairEvent {
+            kind: anchor.kind,
+            bucket: anchor.bucket.clone(),
+            object: anchor.object.clone(),
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            delete_marker_purge: anchor.delete_marker_purge,
+            lease,
+            bucket_incarnation_id: anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        };
+        assert_ne!(current.lease, Some(anchor.lease), "replay must rotate the live attempt lease");
+        rustfs_common::mrf_channel::note_mrf_verified_repair(proof(current.lease));
+        runtime.discharge_durable_replay_anchors();
+        assert_eq!(
+            runtime.partial_writes.depth(),
+            2,
+            "a pre-restart proof cannot release either responsibility"
+        );
+        rustfs_common::mrf_channel::note_mrf_verified_repair(proof(Some(anchor.lease)));
+        runtime.discharge_durable_replay_anchors();
+        assert!(runtime.partial_writes.intent_for_responsibility(current_id).is_none());
+        assert_eq!(runtime.partial_writes.depth(), 1);
+        assert_eq!(
+            runtime.partial_writes.checkpoint_records(super::super::intent_digest),
+            vec![original_unknown.clone()]
+        );
+        assert!(runtime.flush().await, "the retained unknown must reach a new durable checkpoint");
+
+        let mut queue = MrfQueue::new(runtime.config.queue_capacity, runtime.config.journal_max_bytes);
+        let replay = super::super::replay_into(&manager, &mut queue, &mut None).await;
+        assert_eq!(replay.partial_writes.len(), 1, "a second restart must retain only the unresolved unknown");
+        let (_, record) = &replay.partial_writes[0];
+        assert_eq!(
+            record.as_ref(),
+            Some(&original_unknown),
+            "ID, missing source, state and detection time must survive"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

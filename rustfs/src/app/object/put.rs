@@ -1261,6 +1261,7 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(InvalidStorageClass));
         }
+        reject_non_wildcard_write_if_none_match(req.input.if_none_match.as_ref(), &req.headers)?;
         // An authorized inbound replication PUT must store the replica verbatim.
         // Legacy snowball-extracted members may still carry the auto-extract
         // metadata, which replication replays as a header. Do not interpret that
@@ -3573,6 +3574,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_put_object_rejects_post_object_etag_if_none_match_header() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .expect("POST-to-PUT input should build without conditional DTO fields");
+        let mut req = build_request(input, Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+        req.headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"different-etag\""));
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let err = Box::pin(usecase.execute_put_object(&FS::new(), req))
+            .await
+            .expect_err("POST header-only ETag precondition must fail before storage access");
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
     async fn execute_put_object_rejects_post_object_sse_kms_from_input() {
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())
@@ -4091,6 +4111,62 @@ mod tests {
             .expect_err("4 GiB used plus a 2 GiB PUT must exceed a 5 GiB legacy quota");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert!(!body_polled.load(Ordering::Acquire), "legacy quota rejection must not consume the body");
+    }
+
+    /// Regression (rustfs/backlog#2904, decision D3 in rustfs/backlog#2872): a
+    /// bucket admitted by the durable reservation ledger must accept a write
+    /// even when no scanner usage baseline exists anywhere, and the ledger
+    /// alone still refuses an over-limit write. Before the fix the checker's
+    /// `UsageUnavailable` was mapped to a retryable 503 for every PUT.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_quota_put_succeeds_without_any_usage_baseline() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        const LIMIT: u64 = 1 << 20;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        let bucket = format!("durable-no-usage-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create durable quota test bucket");
+        // Deliberately no usage seed: neither the memory cache nor a persisted
+        // snapshot knows this bucket, so the scanner-side lookup fails.
+        let metadata_sys = DefaultObjectUsecase::from_global()
+            .bucket_metadata_sys()
+            .expect("test app context should expose bucket metadata");
+        QuotaChecker::new(metadata_sys)
+            .set_quota_config(&bucket, BucketQuota::new(Some(LIMIT)))
+            .await
+            .expect("configure durable quota");
+
+        let payload = Bytes::from(vec![0x42; 1024]);
+        let input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key("fits".to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("PUT input should build");
+        DefaultObjectUsecase::from_global()
+            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+            .await
+            .expect("a ledger-admitted bucket must accept a write without scanner usage");
+
+        let too_large = Bytes::from(vec![0x42; (LIMIT + 1) as usize]);
+        let input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key("too-large".to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(too_large.clone()))))
+            .content_length(Some(i64::try_from(too_large.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("PUT input should build");
+        let err = DefaultObjectUsecase::from_global()
+            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+            .await
+            .expect_err("the ledger must still reject a write above the quota limit");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[tokio::test]
